@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Steam Cast &amp; Control</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --accent: #66c0f4;
+    --ok: #4caf50; --warn: #f4a340; --text: #c7d5e0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", Arial, sans-serif; height: 100vh;
+    display: flex; flex-direction: column;
+  }
+  header {
+    background: var(--panel); padding: 8px 14px; display: flex;
+    align-items: center; gap: 10px; flex-wrap: wrap;
+    border-bottom: 1px solid #2a2f3a;
+  }
+  h1 { font-size: 14px; margin: 0; color: var(--accent); font-weight: 600; }
+  #status { margin-left: auto; font-size: 11px; padding: 4px 10px; border-radius: 12px; background: #2a2f3a; }
+  #status.control { background: var(--warn); color: #201400; font-weight: 700; }
+  #status.connected { background: var(--ok); color: #06210a; }
+
+  main { flex: 1; position: relative; background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  canvas { max-width: 100%; max-height: 100%; display: none; image-rendering: -webkit-optimize-contrast; }
+  #placeholder { color: #566; font-size: 13px; text-align: center; max-width: 540px; line-height: 1.6; padding: 0 20px; }
+  #overlay {
+    position: absolute; top: 8px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,.7); padding: 6px 14px; border-radius: 6px; font-size: 12px;
+    display: none; pointer-events: none;
+  }
+  #overlay.show { display: block; }
+
+  #console {
+    background: #05070a; border-top: 1px solid #2a2f3a; font-family: Consolas, monospace;
+    font-size: 12.5px; padding: 8px 10px; height: 150px; display: flex; flex-direction: column;
+  }
+  #consoleLog { flex: 1; overflow-y: auto; color: #7fdc7f; white-space: pre-wrap; margin-bottom: 6px; }
+  #consoleLog .err { color: #ff6b6b; }
+  #consoleLog .info { color: #66c0f4; }
+  #consoleLog .notice { color: #f4a340; font-weight: 700; }
+  #consoleInputRow { display: flex; align-items: center; gap: 6px; }
+  #consoleInputRow span { color: var(--accent); }
+  #consoleInput {
+    flex: 1; background: transparent; border: none; outline: none;
+    color: #c7d5e0; font-family: Consolas, monospace; font-size: 12.5px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Steam Cast &amp; Control</h1>
+  <span id="status">not connected</span>
+</header>
+
+<main>
+  <div id="placeholder">
+    On the PC with Steam, run the helper:<br/>
+    <code>pip install websockets pyautogui pygetwindow mss pillow</code><br/>
+    <code>python server.py</code><br/><br/>
+    It will print a <b>connect code</b>. Type it below as:<br/>
+    <code>connect XXXX-XXXX-XXXX</code><br/><br/>
+    Once connected, double-click the video to take control.
+    Press <b>F1</b> to release control.
+  </div>
+  <canvas id="canvas"></canvas>
+  <div id="overlay">CONTROL MODE — press <b>F1</b> to release</div>
+</main>
+
+<div id="console">
+  <div id="consoleLog"></div>
+  <div id="consoleInputRow">
+    <span>&gt;</span>
+    <input id="consoleInput" type="text" placeholder="type 'help' — e.g. connect XXXX-XXXX-XXXX" autofocus />
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const placeholder = document.getElementById("placeholder");
+const overlay = document.getElementById("overlay");
+const statusEl = document.getElementById("status");
+const logEl = document.getElementById("consoleLog");
+const input = document.getElementById("consoleInput");
+
+let ws = null;
+let controlling = false;
+let hasControlPermission = false; // must be granted by the host before input is forwarded
+let targetIp = null;
+let targetPort = 8765;
+let region = null; // {left, top, w, h} of the real Steam window, from the helper
+let availableMonitors = []; // [{id, name}] sent by the helper after connecting
+let availableWindows = []; // [{id, title}] sent by the helper after connecting
+
+function log(msg, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+log("Steam Cast & Control console. Type 'help' for commands.", "info");
+
+// --- base32 decode (RFC4648), no external libs ---
+function base32Decode(str) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  str = str.toUpperCase().replace(/[^A-Z2-7]/g, "");
+  let bits = "";
+  for (const c of str) {
+    const val = alphabet.indexOf(c);
+    if (val === -1) continue;
+    bits += val.toString(2).padStart(5, "0");
+  }
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) {
+    bytes.push(parseInt(bits.substr(i, 8), 2));
+  }
+  return new Uint8Array(bytes);
+}
+function decodeCode(code) {
+  const bytes = base32Decode(code);
+  const str = new TextDecoder().decode(bytes); // "ip:port"
+  const idx = str.lastIndexOf(":");
+  if (idx === -1) return null;
+  return { ip: str.slice(0, idx), port: Number(str.slice(idx + 1)) };
+}
+
+function connect(ip, port) {
+  if (ws) { try { ws.close(); } catch (e) {} }
+  hasControlPermission = false;
+  controlling = false;
+  targetIp = ip; targetPort = port || 8765;
+  log(`Connecting to ${targetIp}:${targetPort} ...`, "info");
+  ws = new WebSocket(`ws://${targetIp}:${targetPort}`);
+  ws.onopen = () => {
+    statusEl.textContent = `connected: ${targetIp}:${targetPort}`;
+    statusEl.className = "connected";
+    log(`Connected to ${targetIp}:${targetPort}`, "info");
+  };
+  ws.onmessage = (evt) => {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch { return; }
+    if (msg.type === "control_granted") {
+      hasControlPermission = true;
+      log("Control granted. Double-click the video to take control (F1 to release).", "notice");
+      return;
+    }
+    if (msg.type === "control_denied") {
+      hasControlPermission = false;
+      log("Control request was denied on the host.", "err");
+      return;
+    }
+    if (msg.type === "sources") {
+      availableMonitors = msg.monitors || [];
+      availableWindows = msg.windows || [];
+      let list = "Which screen/window do you want to cast?\n";
+      availableMonitors.forEach((m, i) => { list += `  monitor ${i + 1}   — full screen: ${m.name}\n`; });
+      availableWindows.forEach((w, i) => { list += `  window ${i + 1}    — ${w.title}\n`; });
+      list += `  steam            — auto-track a window titled "Steam" (default)\n`;
+      list += `  window <text>    — auto-track any window whose title contains <text>`;
+      log(list, "notice");
+      return;
+    }
+    if (msg.type === "frame") {
+      region = { left: msg.left, top: msg.top, w: msg.w, h: msg.h };
+      const img = new Image();
+      img.onload = () => {
+        if (canvas.width !== msg.w || canvas.height !== msg.h) {
+          canvas.width = msg.w; canvas.height = msg.h;
+        }
+        ctx.drawImage(img, 0, 0);
+        if (canvas.style.display !== "block") {
+          canvas.style.display = "block";
+          placeholder.style.display = "none";
+        }
+      };
+      img.src = "data:image/jpeg;base64," + msg.data;
+    }
+  };
+  ws.onclose = () => {
+    statusEl.textContent = "not connected";
+    statusEl.className = "";
+    log("Disconnected.", "err");
+    canvas.style.display = "none";
+    placeholder.style.display = "block";
+    exitControl();
+  };
+  ws.onerror = () => log("Connection error — is server.py running at that address?", "err");
+}
+
+function send(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
+// --- console commands ---
+input.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  const raw = input.value.trim();
+  input.value = "";
+  if (!raw) return;
+  log("> " + raw);
+  const [cmd, ...rest] = raw.split(/\s+/);
+  const arg = rest.join(" ");
+
+  switch (cmd.toLowerCase()) {
+    case "connect": {
+      if (!arg) { log("Usage: connect <code>", "err"); break; }
+      const decoded = decodeCode(arg);
+      if (!decoded) { log("Couldn't read that code — check it was copied correctly.", "err"); break; }
+      log(`IP ${decoded.ip} will cast their device to you.`, "notice");
+      connect(decoded.ip, decoded.port);
+      break;
+    }
+    case "ip":
+      if (!arg) { log("Usage: ip <address>  e.g. ip 192.168.1.23", "err"); break; }
+      connect(arg, targetPort);
+      break;
+    case "port":
+      if (!arg || isNaN(Number(arg))) { log("Usage: port <number>", "err"); break; }
+      targetPort = Number(arg);
+      log(`Port set to ${targetPort}. Reconnecting...`, "info");
+      if (targetIp) connect(targetIp, targetPort);
+      break;
+    case "takecontrol": {
+      if (hasControlPermission) { log("You already have control — double-click the video (F1 to release).", "info"); break; }
+      send({ type: "request_control", name: arg || undefined });
+      log("Requesting control — waiting for approval on the host...", "info");
+      break;
+    }
+    case "monitor": {
+      const n = Number(arg);
+      if (!n || !availableMonitors[n - 1]) { log("Usage: monitor <number> — see the list above.", "err"); break; }
+      const m = availableMonitors[n - 1];
+      send({ type: "select_monitor", id: m.id });
+      log(`Casting full monitor: ${m.name}`, "notice");
+      break;
+    }
+    case "window": {
+      if (!arg) { log("Usage: window <number from list> or window <text to search for>", "err"); break; }
+      const n = Number(arg);
+      if (n && availableWindows[n - 1]) {
+        const w = availableWindows[n - 1];
+        send({ type: "select_window", id: w.id });
+        log(`Casting window: ${w.title}`, "notice");
+      } else {
+        send({ type: "select_window", name: arg });
+        log(`Casting window matching: "${arg}"`, "notice");
+      }
+      break;
+    }
+    case "steam":
+      send({ type: "select_steam" });
+      log("Casting: Steam window (auto-tracked)", "notice");
+      break;
+    case "status":
+      log(`Target: ${targetIp || "(none)"}:${targetPort}  |  WS: ${ws ? ws.readyState : "none"}  |  Control: ${controlling}`);
+      break;
+    case "help":
+      log("Commands:\n  connect <code>   decode a connect code and connect to that device\n  ip <address>     connect directly by IP (fallback)\n  port <number>    set the port (default 8765) then reconnects\n  takecontrol      request permission from the host to control this device\n  takecontrol <name>  same, but shows <name> to the host instead of your IP\n  monitor <n>      cast a full monitor (see list after connecting)\n  window <n>       cast a specific open window (see list after connecting)\n  window <text>    cast any window whose title contains <text>\n  steam            cast a window titled 'Steam' (default)\n  status           show current connection state\n  help             show this list");
+      break;
+    default:
+      log(`Unknown command: ${cmd}. Type 'help'.`, "err");
+  }
+});
+
+// --- coordinate mapping: canvas display box -> real screen coords ---
+function mapToScreen(clientX, clientY) {
+  if (!region) return { x: clientX, y: clientY };
+  const rect = canvas.getBoundingClientRect();
+  const fx = (clientX - rect.left) / rect.width;
+  const fy = (clientY - rect.top) / rect.height;
+  return {
+    x: Math.round(region.left + fx * region.w),
+    y: Math.round(region.top + fy * region.h)
+  };
+}
+
+// --- control mode ---
+function enterControl() {
+  if (controlling) return;
+  controlling = true;
+  overlay.classList.add("show");
+  statusEl.classList.add("control");
+  statusEl.textContent = "CONTROL MODE (F1 to release)";
+}
+function exitControl() {
+  if (!controlling) return;
+  controlling = false;
+  overlay.classList.remove("show");
+  statusEl.classList.remove("control");
+  statusEl.textContent = ws && ws.readyState === WebSocket.OPEN
+    ? `connected: ${targetIp}:${targetPort}` : "not connected";
+}
+
+canvas.addEventListener("dblclick", (e) => {
+  e.preventDefault();
+  if (!hasControlPermission) {
+    send({ type: "request_control" });
+    log("Requesting control — waiting for approval on the host...", "info");
+    return;
+  }
+  enterControl();
+  const { x, y } = mapToScreen(e.clientX, e.clientY);
+  send({ type: "dblclick", x, y });
+});
+canvas.addEventListener("mousemove", (e) => {
+  if (!controlling) return;
+  const { x, y } = mapToScreen(e.clientX, e.clientY);
+  send({ type: "move", x, y });
+});
+canvas.addEventListener("mousedown", (e) => {
+  if (!controlling) return;
+  e.preventDefault();
+  const { x, y } = mapToScreen(e.clientX, e.clientY);
+  send({ type: "click", x, y, button: e.button });
+});
+canvas.addEventListener("contextmenu", (e) => { if (controlling) e.preventDefault(); });
+canvas.addEventListener("wheel", (e) => {
+  if (!controlling) return;
+  e.preventDefault();
+  send({ type: "scroll", dy: e.deltaY });
+}, { passive: false });
+
+// Keep the console input focused so typing always lands there,
+// unless we're actively in control mode (then keys go to Steam instead).
+window.addEventListener("load", () => input.focus());
+document.addEventListener("click", (e) => {
+  if (e.target !== canvas) input.focus();
+});
+
+window.addEventListener("keydown", (e) => {
+  if (e.code === "F1") { e.preventDefault(); exitControl(); return; }
+  if (document.activeElement !== input && !controlling) {
+    input.focus(); // grab focus so the keystroke lands in the console box
+  }
+  if (document.activeElement === input) return; // typing in console, don't forward
+  if (!controlling) return;
+  e.preventDefault();
+  send({ type: "keydown", code: e.code });
+});
+window.addEventListener("keyup", (e) => {
+  if (e.code === "F1") return;
+  if (document.activeElement === input) return;
+  if (!controlling) return;
+  e.preventDefault();
+  send({ type: "keyup", code: e.code });
+});
+</script>
+
+</body>
+</html>
